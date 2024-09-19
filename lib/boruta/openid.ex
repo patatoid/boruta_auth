@@ -24,6 +24,7 @@ defmodule Boruta.Openid do
   > The definition of those callbacks are provided by either `Boruta.Openid.Application` or `Boruta.Openid.JwksApplication` and `Boruta.Openid.UserinfoApplication`
   """
 
+  alias Boruta.AccessTokensAdapter
   alias Boruta.ClientsAdapter
   alias Boruta.CodesAdapter
   alias Boruta.CredentialsAdapter
@@ -31,6 +32,7 @@ defmodule Boruta.Openid do
   alias Boruta.Oauth.Authorization.AccessToken
   alias Boruta.Oauth.BearerToken
   alias Boruta.Oauth.Error
+  alias Boruta.Oauth.ResourceOwner
   alias Boruta.Oauth.Token
   alias Boruta.Openid.Credential
   alias Boruta.Openid.CredentialResponse
@@ -148,11 +150,11 @@ defmodule Boruta.Openid do
           module :: atom()
         ) :: any()
   def direct_post(conn, direct_post_params, module) do
-    with {:ok, _claims} <- check_id_token_client(direct_post_params),
+    with {:ok, claims} <- check_id_token_client(direct_post_params),
          %Token{value: value} <- CodesAdapter.get_by(id: direct_post_params[:code_id]),
          {:ok, code} <- Authorization.Code.authorize(%{value: value}) do
       case maybe_check_presentation(direct_post_params, code.presentation_definition) do
-        :ok ->
+        {:ok, _sub, presentation_claims} ->
           query =
             %{
               code: code.value,
@@ -166,9 +168,33 @@ defmodule Boruta.Openid do
             %{response | host: response.host || "", query: query}
             |> URI.to_string()
 
-          module.direct_post_success(conn, response)
+          sub = claims["sub"]
+
+          {:ok, token} =
+            AccessTokensAdapter.create(
+              %{
+                client: code.client,
+                resource_owner: %ResourceOwner{
+                  sub: sub,
+                  extra_claims: presentation_claims
+                },
+                redirect_uri: code.relying_party_redirect_uri,
+                sub: sub,
+                scope: code.scope,
+                state: code.state,
+                previous_code: code.value
+              },
+              refresh_token: false
+            )
+
+          module.direct_post_success(conn, response, token)
+
         {:error, error} ->
-          module.authentication_failure(conn, %{error | redirect_uri: code.redirect_uri, state: code.state})
+          module.authentication_failure(conn, %{
+            error
+            | redirect_uri: code.redirect_uri,
+              state: code.state
+          })
       end
     else
       {:error, error} ->
@@ -229,8 +255,8 @@ defmodule Boruta.Openid do
                presentation_submission,
                presentation_definition
              ) do
-          :ok ->
-            :ok
+          {:ok, sub, claims} ->
+            {:ok, sub, claims}
 
           {:error, error} ->
             error = %Error{
@@ -268,7 +294,7 @@ defmodule Boruta.Openid do
      }}
   end
 
-  defp maybe_check_presentation(_, _), do: :ok
+  defp maybe_check_presentation(_, _), do: {:ok, nil, %{}}
 
   alias Boruta.Openid.Json.Schema
   alias ExJsonSchema.Validator.Error.BorutaFormatter
