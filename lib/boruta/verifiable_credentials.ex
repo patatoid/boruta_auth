@@ -187,7 +187,7 @@ defmodule Boruta.VerifiableCredentials do
   end
 
   @spec validate_signature(jwt :: String.t()) ::
-          {:ok, jwk ::map(), claims :: map()} | {:error, reason :: String.t()}
+          {:ok, jwk :: map(), claims :: map()} | {:error, reason :: String.t()}
   def validate_signature(jwt) when is_binary(jwt) do
     case Joken.peek_header(jwt) do
       {:ok, %{"alg" => alg} = headers} ->
@@ -196,9 +196,10 @@ defmodule Boruta.VerifiableCredentials do
       error ->
         {:error, inspect(error)}
     end
-  # rescue
-  #   error ->
-  #     {:error, inspect(error)}
+
+    # rescue
+    #   error ->
+    #     {:error, inspect(error)}
   end
 
   def validate_signature(_jwt), do: {:error, "Proof does not contain a valid JWT."}
@@ -206,24 +207,26 @@ defmodule Boruta.VerifiableCredentials do
   defp verify_jwt({:did, did}, alg, jwt) do
     with {:ok, did_document} <- Did.resolve(did),
          %{"verificationMethod" => methods} <- did_document do
+      Enum.reduce_while(
+        methods,
+        {:error, "no did verification method found with did #{did}."},
+        fn %{"publicKeyJwk" => jwk}, {:error, errors} ->
+          signer =
+            Joken.Signer.create(alg, %{"pem" => JOSE.JWK.from_map(jwk) |> JOSE.JWK.to_pem()})
 
-        Enum.reduce_while(
-          methods,
-          {:error, "no did verification method found with did #{did}."},
-          fn %{"publicKeyJwk" => jwk}, {:error, errors} ->
-            signer =
-              Joken.Signer.create(alg, %{"pem" => JOSE.JWK.from_map(jwk) |> JOSE.JWK.to_pem()})
+          case Client.Token.verify(jwt, signer) do
+            {:ok, claims} ->
+              {:halt, {:ok, jwk, claims}}
 
-            case Client.Token.verify(jwt, signer) do
-              {:ok, claims} -> {:halt, {:ok, jwk, claims}}
-              {:error, error} -> {:cont, {:error, errors <> ", #{inspect(error)} with key #{inspect(jwk)}"}}
-            end
+            {:error, error} ->
+              {:cont, {:error, errors <> ", #{inspect(error)} with key #{inspect(jwk)}"}}
           end
-        )
-
+        end
+      )
     else
       {:error, error} ->
         {:error, error}
+
       did_document ->
         {:error, "Invalid did document: \"#{inspect(did_document)}\""}
     end
@@ -330,47 +333,41 @@ defmodule Boruta.VerifiableCredentials do
        when format in ["jwt_vc_json"] do
     client = token.client
 
-    signer =
-      Joken.Signer.create(
-        client.id_token_signature_alg,
-        %{"pem" => client.private_key},
-        %{
-          "typ" => "JWT",
-          "kid" => case client.did do
-            nil ->
-              Client.Crypto.kid_from_private_key(client.private_key)
-            did ->
-              did <> "#" <> String.replace(did, "did:key:", "")
-          end
-        }
-      )
+    with {:ok, trust_chain} <- Config.resource_owners().trust_chain(client) do
+      signer =
+        Joken.Signer.create(
+          client.id_token_signature_alg,
+          %{"pem" => client.private_key},
+          %{
+            "typ" => "JWT",
+            "kid" =>
+              case client.did do
+                nil ->
+                  Client.Crypto.kid_from_private_key(client.private_key)
 
-    sub =
-      case Joken.peek_header(proof) do
-        {:ok, headers} ->
-          case(extract_key(headers)) do
-            {_type, key} -> key
-          end
-      end
+                did ->
+                  did <> "#" <> String.replace(did, "did:key:", "")
+              end,
+            "trust_chain" => trust_chain
+          }
+        )
 
-    credential_id = SecureRandom.uuid()
+      sub =
+        case Joken.peek_header(proof) do
+          {:ok, headers} ->
+            case(extract_key(headers)) do
+              {_type, key} -> key
+            end
+        end
 
-    now = :os.system_time(:seconds)
+      credential_id = SecureRandom.uuid()
 
-    sub = sub |> String.split("#") |> List.first()
-    claims = %{
-      "sub" => sub,
-      # TODO store credential
-      "jti" => Config.issuer() <> "/credentials/#{credential_id}",
-      "iss" => client.did,
-      "nbf" => now,
-      "iat" => now,
-      "exp" => now + credential_configuration[:time_to_live],
-      "nonce" => token.c_nonce,
-      "vc" => %{
-        "@context" => [
-          "https://www.w3.org/2018/credentials/v1"
-        ],
+      now = :os.system_time(:seconds)
+
+      sub = sub |> String.split("#") |> List.first()
+
+      claims = %{
+        "sub" => sub,
         # TODO store credential
         "id" => Config.issuer() <> "/credentials/#{credential_id}",
         "issued" => DateTime.from_unix!(now) |> DateTime.to_iso8601(),
@@ -391,11 +388,11 @@ defmodule Boruta.VerifiableCredentials do
           "type" => "FullJsonSchemaValidator2021"
         }
       }
-    }
 
-    credential = Token.generate_and_sign!(claims, signer)
+      credential = Token.generate_and_sign!(claims, signer)
 
-    {:ok, credential}
+      {:ok, credential}
+    end
   end
 
   # https://www.w3.org/TR/vc-data-model-2.0/
@@ -409,53 +406,57 @@ defmodule Boruta.VerifiableCredentials do
        when format in ["jwt_vc"] do
     client = token.client
 
-    signer =
-      Joken.Signer.create(
-        client.id_token_signature_alg,
-        %{"pem" => client.private_key},
-        %{
-          "typ" => "JWT",
+    with {:ok, trust_chain} <- Config.resource_owners().trust_chain(client) do
+      signer =
+        Joken.Signer.create(
+          client.id_token_signature_alg,
+          %{"pem" => client.private_key},
+          %{
+            "typ" => "JWT",
+            # TODO craft ebsi compliant dids
+            "kid" => client.did,
+            "trust_chain" => trust_chain
+          }
+        )
+
+      sub =
+        case Joken.peek_header(proof) do
+          {:ok, headers} ->
+            case(extract_key(headers)) do
+              {_type, key} -> key
+            end
+        end
+
+      credential_id = SecureRandom.uuid()
+
+      claims = %{
+        "@context" => [
+          "https://www.w3.org/ns/credentials/v2",
+          "https://www.w3.org/ns/credentials/examples/v2"
+        ],
+        # TODO store credential
+        "id" => Config.issuer() <> "/credentials/#{credential_id}",
+        "type" => credential_configuration[:types],
+        "issuer" => Config.issuer(),
+        "validFrom" => DateTime.utc_now() |> DateTime.to_iso8601(),
+        "credentialSubject" => %{
+          "id" => sub,
           # TODO craft ebsi compliant dids
-          "kid" => client.did
+          credential_identifier =>
+            claims
+            |> Enum.map(fn {name, {claim, _status, _expiration}} -> {name, claim} end)
+            |> Enum.into(%{})
+            |> Map.put("id", client.did)
+        },
+        "cnf" => %{
+          "jwk" => jwk
         }
-      )
-
-    sub =
-      case Joken.peek_header(proof) do
-        {:ok, headers} ->
-          case(extract_key(headers)) do
-            {_type, key} -> key
-          end
-      end
-
-    credential_id = SecureRandom.uuid()
-
-    claims = %{
-      "@context" => [
-        "https://www.w3.org/ns/credentials/v2",
-        "https://www.w3.org/ns/credentials/examples/v2"
-      ],
-      # TODO store credential
-      "id" => Config.issuer() <> "/credentials/#{credential_id}",
-      "type" => credential_configuration[:types],
-      "issuer" => Config.issuer(),
-      "validFrom" => DateTime.utc_now() |> DateTime.to_iso8601(),
-      "credentialSubject" => %{
-        "id" => sub,
-        credential_identifier =>
-          claims
-          |> Enum.map(fn {name, {claim, _status, _expiration}} -> {name, claim} end)
-          |> Enum.into(%{})
-          |> Map.put("id", client.did)
-      },
-      "cnf" => %{
-        "jwk" => jwk
       }
-    }
 
-    credential = Token.generate_and_sign!(claims, signer)
+      credential = Token.generate_and_sign!(claims, signer)
 
-    {:ok, credential}
+      {:ok, credential}
+    end
   end
 
   defp generate_credential(
@@ -468,66 +469,69 @@ defmodule Boruta.VerifiableCredentials do
        when format in ["vc+sd-jwt"] do
     client = token.client
 
-    signer =
-      Joken.Signer.create(
-        client.id_token_signature_alg,
-        %{"pem" => client.private_key},
-        %{
-          "typ" => "JWT",
-          "kid" => client.did || Client.Crypto.kid_from_private_key(client.private_key)
+    with {:ok, trust_chain} <- Config.resource_owners().trust_chain(client) do
+      signer =
+        Joken.Signer.create(
+          client.id_token_signature_alg,
+          %{"pem" => client.private_key},
+          %{
+            "typ" => "JWT",
+            "kid" => Client.Crypto.kid_from_private_key(client.private_key),
+            "trust_chain" => trust_chain
+          }
+        )
+
+      sub =
+        case Joken.peek_header(proof) do
+          {:ok, headers} ->
+            case(extract_key(headers)) do
+              {_type, key} -> key
+            end
+        end
+
+      claims_with_salt =
+        Enum.map(claims, fn {name, {value, status, ttl}} ->
+          {{name, value}, generate_sd_salt(client.private_key, ttl, String.to_atom(status))}
+        end)
+
+      disclosures =
+        claims_with_salt
+        |> Enum.map(fn {{name, value}, salt} ->
+          [salt, name, value]
+        end)
+
+      sd =
+        disclosures
+        # NOTE no space in disclosure array
+        |> Enum.map(fn disclosure -> Jason.encode!(disclosure) end)
+        |> Enum.map(fn disclosure -> Base.url_encode64(disclosure, padding: false) end)
+        |> Enum.map(fn disclosure ->
+          :crypto.hash(:sha256, disclosure) |> Base.url_encode64(padding: false)
+        end)
+
+      claims = %{
+        "sub" => sub,
+        "iss" => Config.issuer(),
+        "iat" => :os.system_time(:seconds),
+        # TODO get exp from configuration
+        "exp" => :os.system_time(:seconds) + credential_configuration[:time_to_live],
+        "nonce" => token.c_nonce,
+        "_sd" => sd,
+        "cnf" => %{
+          "jwk" => jwk
         }
-      )
-
-    sub =
-      case Joken.peek_header(proof) do
-        {:ok, headers} ->
-          case(extract_key(headers)) do
-            {_type, key} -> key
-          end
-      end
-
-    claims_with_salt =
-      Enum.map(claims, fn {name, {value, status, ttl}} ->
-        {{name, value}, generate_sd_salt(client.private_key, ttl, String.to_atom(status))}
-      end)
-
-    disclosures =
-      claims_with_salt
-      |> Enum.map(fn {{name, value}, salt} ->
-        [salt, name, value]
-      end)
-
-    sd =
-      disclosures
-      # NOTE no space in disclosure array
-      |> Enum.map(fn disclosure -> Jason.encode!(disclosure) end)
-      |> Enum.map(fn disclosure -> Base.url_encode64(disclosure, padding: false) end)
-      |> Enum.map(fn disclosure ->
-        :crypto.hash(:sha256, disclosure) |> Base.url_encode64(padding: false)
-      end)
-
-    claims = %{
-      "sub" => sub,
-      "iss" => Config.issuer(),
-      "iat" => :os.system_time(:seconds),
-      # TODO get exp from configuration
-      "exp" => :os.system_time(:seconds) + credential_configuration[:time_to_live],
-      "nonce" => token.c_nonce,
-      "_sd" => sd,
-      "cnf" => %{
-        "jwk" => jwk
       }
-    }
 
-    credential = Token.generate_and_sign!(claims, signer)
+      credential = Token.generate_and_sign!(claims, signer)
 
-    tokens =
-      [credential] ++
-        (disclosures
-         |> Enum.map(&Jason.encode!/1)
-         |> Enum.map(&Base.url_encode64(&1, padding: false)))
+      tokens =
+        [credential] ++
+          (disclosures
+           |> Enum.map(&Jason.encode!/1)
+           |> Enum.map(&Base.url_encode64(&1, padding: false)))
 
-    {:ok, Enum.join(tokens, "~") <> "~"}
+      {:ok, Enum.join(tokens, "~") <> "~"}
+    end
   end
 
   defp generate_credential(_claims, _credential_configuration, _proof, _client, _format),
