@@ -442,7 +442,6 @@ defmodule Boruta.VerifiableCredentials do
       "validFrom" => DateTime.utc_now() |> DateTime.to_iso8601(),
       "credentialSubject" => %{
         "id" => sub,
-        # TODO craft ebsi compliant dids
         credential_identifier =>
           claims
           |> Enum.map(fn {name, {claim, _status, _expiration}} -> {name, claim} end)
@@ -475,7 +474,7 @@ defmodule Boruta.VerifiableCredentials do
         %{"pem" => client.private_key},
         %{
           "typ" => "JWT",
-          "kid" => Client.Crypto.kid_from_private_key(client.private_key)
+          "kid" => client.did || Client.Crypto.kid_from_private_key(client.private_key)
         }
       )
 
