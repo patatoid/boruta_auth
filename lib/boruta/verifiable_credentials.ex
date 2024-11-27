@@ -229,6 +229,18 @@ defmodule Boruta.VerifiableCredentials do
     end
   end
 
+  defp verify_jwt({:jwk, jwk}, "EdDSA", jwt) do
+    signer = Joken.Signer.create("ES256", %{"pem" => jwk |> JOSE.JWK.from_map() |> JOSE.JWK.to_pem()})
+
+    case Token.verify(jwt, signer) do
+      {:ok, claims} ->
+        {:ok, jwk, claims}
+
+      _ ->
+        {:error, "Bad proof signature"}
+    end
+  end
+
   defp verify_jwt({:jwk, jwk}, alg, jwt) do
     signer = Joken.Signer.create(alg, %{"pem" => jwk |> JOSE.JWK.from_map() |> JOSE.JWK.to_pem()})
 
@@ -261,7 +273,7 @@ defmodule Boruta.VerifiableCredentials do
     case Joken.peek_header(jwt) do
       {:ok, %{"alg" => alg, "typ" => typ} = headers} ->
         alg_check =
-          case alg =~ ~r/^(RS|ES)/ do
+          case alg =~ ~r/^(RS|ES|EdDSA)/ do
             true ->
               :ok
 
@@ -430,7 +442,6 @@ defmodule Boruta.VerifiableCredentials do
       "validFrom" => DateTime.utc_now() |> DateTime.to_iso8601(),
       "credentialSubject" => %{
         "id" => sub,
-        # TODO craft ebsi compliant dids
         credential_identifier =>
           claims
           |> Enum.map(fn {name, {claim, _status, _expiration}} -> {name, claim} end)
@@ -463,7 +474,7 @@ defmodule Boruta.VerifiableCredentials do
         %{"pem" => client.private_key},
         %{
           "typ" => "JWT",
-          "kid" => Client.Crypto.kid_from_private_key(client.private_key)
+          "kid" => client.did || Client.Crypto.kid_from_private_key(client.private_key)
         }
       )
 
