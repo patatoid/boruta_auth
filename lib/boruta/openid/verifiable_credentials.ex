@@ -1,4 +1,4 @@
-defmodule Boruta.VerifiableCredentials do
+defmodule Boruta.Openid.VerifiableCredentials do
   defmodule Hotp do
     @moduledoc """
     Implements HOTP generation as described in the IETF RFC
@@ -105,7 +105,7 @@ defmodule Boruta.VerifiableCredentials do
           credential_params :: map(),
           token :: Boruta.Oauth.Token.t(),
           default_credential_configuration :: map()
-        ) :: {:ok, map()} | {:error, String.t()}
+        ) :: {:ok, credential :: Credential.t()} | {:error, reason :: String.t()}
   def issue_verifiable_credential(
         resource_owner,
         credential_params,
@@ -307,7 +307,7 @@ defmodule Boruta.VerifiableCredentials do
               :ok
           end
 
-        do_validate_headers(alg_check, typ_check, key_check)
+        do_validate_headers([alg_check, typ_check, key_check])
 
       _ ->
         {:error, "Proof does not contain valid JWT headers, `alg` and `typ` are required."}
@@ -338,23 +338,6 @@ defmodule Boruta.VerifiableCredentials do
        when format in ["jwt_vc_json"] do
     client = token.client
 
-    signer =
-      Joken.Signer.create(
-        client.id_token_signature_alg,
-        %{"pem" => client.private_key},
-        %{
-          "typ" => "JWT",
-          "kid" =>
-            case client.did do
-              nil ->
-                Client.Crypto.kid_from_private_key(client.private_key)
-
-              did ->
-                did <> "#" <> String.replace(did, "did:key:", "")
-            end
-        }
-      )
-
     sub =
       case Joken.peek_header(proof) do
         {:ok, headers} ->
@@ -363,23 +346,15 @@ defmodule Boruta.VerifiableCredentials do
           end
       end
 
-    credential_id = SecureRandom.uuid()
-
     now = :os.system_time(:seconds)
-
+    credential_id = SecureRandom.uuid()
     sub = sub |> String.split("#") |> List.first()
-    iss = case client.did do
-      nil ->
-        Config.issuer()
-      did ->
-        did |> String.split("#") |> List.first()
-    end
 
-    claims = %{
+    payload = %{
       "sub" => sub,
       # TODO store credential
       "jti" => Config.issuer() <> "/credentials/#{credential_id}",
-      "iss" => iss,
+      "iss" => Did.controller(client.did) || Config.issuer(),
       "nbf" => now,
       "iat" => now,
       "exp" => now + credential_configuration[:time_to_live],
@@ -411,9 +386,13 @@ defmodule Boruta.VerifiableCredentials do
       }
     }
 
-    credential = Token.generate_and_sign!(claims, signer)
+    case Client.signatures_adapter(client).verifiable_credential_sign(payload, client, format) do
+      {:error, error} ->
+        {:error, error}
 
-    {:ok, credential}
+      credential ->
+        {:ok, credential}
+    end
   end
 
   # https://www.w3.org/TR/vc-data-model-2.0/
@@ -427,40 +406,30 @@ defmodule Boruta.VerifiableCredentials do
        when format in ["jwt_vc"] do
     client = token.client
 
-    signer =
-      Joken.Signer.create(
-        client.id_token_signature_alg,
-        %{"pem" => client.private_key},
-        %{
-          "typ" => "JWT",
-          # TODO craft ebsi compliant dids
-          "kid" => client.did
-        }
-      )
-
     sub =
       case Joken.peek_header(proof) do
         {:ok, headers} ->
-          case(extract_key(headers)) do
+          case extract_key(headers) do
             {_type, key} -> key
           end
       end
 
     credential_id = SecureRandom.uuid()
+    now = :os.system_time(:seconds)
 
-    claims = %{
+    payload = %{
       "@context" => [
-        "https://www.w3.org/ns/credentials/v2",
-        "https://www.w3.org/ns/credentials/examples/v2"
+        "https://www.w3.org/ns/credentials/v2"
       ],
       # TODO store credential
       "id" => Config.issuer() <> "/credentials/#{credential_id}",
+      "issued" => DateTime.from_unix!(now) |> DateTime.to_iso8601(),
+      "issuanceDate" => DateTime.from_unix!(now) |> DateTime.to_iso8601(),
       "type" => credential_configuration[:types],
-      "issuer" => Config.issuer(),
+      "issuer" => Did.controller(client.did),
       "validFrom" => DateTime.utc_now() |> DateTime.to_iso8601(),
       "credentialSubject" => %{
         "id" => sub,
-        # TODO craft ebsi compliant dids
         credential_identifier =>
           claims
           |> Enum.map(fn {name, {claim, _status, _expiration}} -> {name, claim} end)
@@ -472,9 +441,13 @@ defmodule Boruta.VerifiableCredentials do
       }
     }
 
-    credential = Token.generate_and_sign!(claims, signer)
+    case Client.signatures_adapter(client).verifiable_credential_sign(payload, client, format) do
+      {:error, error} ->
+        {:error, error}
 
-    {:ok, credential}
+      credential ->
+        {:ok, credential}
+    end
   end
 
   defp generate_credential(
@@ -486,16 +459,6 @@ defmodule Boruta.VerifiableCredentials do
        )
        when format in ["vc+sd-jwt"] do
     client = token.client
-
-    signer =
-      Joken.Signer.create(
-        client.id_token_signature_alg,
-        %{"pem" => client.private_key},
-        %{
-          "typ" => "dc+sd-jwt",
-          "kid" => client.did || Client.Crypto.kid_from_private_key(client.private_key)
-        }
-      )
 
     sub =
       case Joken.peek_header(proof) do
@@ -525,19 +488,11 @@ defmodule Boruta.VerifiableCredentials do
         :crypto.hash(:sha256, disclosure) |> Base.url_encode64(padding: false)
       end)
 
-    iss = case client.did do
-      nil ->
-        Config.issuer()
-      did ->
-        did |> String.split("#") |> List.first()
-    end
-
-    claims = %{
+    payload = %{
       "sub" => sub,
-      "iss" => iss,
       "vct" => credential_configuration[:vct],
+      "iss" => Did.controller(client.did) || Config.issuer(),
       "iat" => :os.system_time(:seconds),
-      # TODO get exp from configuration
       "exp" => :os.system_time(:seconds) + credential_configuration[:time_to_live],
       "_sd" => sd,
       "cnf" => %{
@@ -545,15 +500,19 @@ defmodule Boruta.VerifiableCredentials do
       }
     }
 
-    credential = Token.generate_and_sign!(claims, signer)
+    case Client.signatures_adapter(client).verifiable_credential_sign(payload, client, format) do
+      {:error, error} ->
+        {:error, error}
 
-    tokens =
-      [credential] ++
-        (disclosures
-         |> Enum.map(&Jason.encode!/1)
-         |> Enum.map(&Base.url_encode64(&1, padding: false)))
+      credential ->
+        tokens =
+          [credential] ++
+            (disclosures
+             |> Enum.map(&Jason.encode!/1)
+             |> Enum.map(&Base.url_encode64(&1, padding: false)))
 
-    {:ok, Enum.join(tokens, "~") <> "~"}
+        {:ok, Enum.join(tokens, "~") <> "~"}
+    end
   end
 
   defp generate_credential(_claims, _credential_configuration, _proof, _client, _format),
@@ -671,25 +630,16 @@ defmodule Boruta.VerifiableCredentials do
   defp extract_key(%{"jwk" => jwk}), do: {:jwk, jwk}
   defp extract_key(_headers), do: {:error, "No proof key material found in JWT headers"}
 
-  defp do_validate_headers(alg_check, typ_check, key_check) do
-    case Enum.reject(
-           [
-             alg_check,
-             typ_check,
-             key_check
-           ],
-           fn
-             :ok -> true
-             _ -> false
-           end
-         ) do
-      [] ->
-        :ok
-
-      errors ->
-        {:error, Enum.join(errors, ", ") <> "."}
-    end
+  defp do_validate_headers(checks) do
+    do_validate_headers(checks, [])
   end
+
+  defp do_validate_headers([], []), do: :ok
+  defp do_validate_headers([], errors), do: {:error, Enum.join(errors, ", ") <> "."}
+  defp do_validate_headers([:ok | checks], errors), do: do_validate_headers(checks, errors)
+
+  defp do_validate_headers([error | checks], errors),
+    do: do_validate_headers(checks, errors ++ [error])
 
   def shift(status) do
     Atom.to_string(status)
