@@ -1,4 +1,6 @@
-defmodule Boruta.VerifiableCredentials do
+defmodule Boruta.Openid.VerifiableCredentials do
+  @moduledoc false
+
   defmodule Hotp do
     @moduledoc """
     Implements HOTP generation as described in the IETF RFC
@@ -39,7 +41,109 @@ defmodule Boruta.VerifiableCredentials do
     end
   end
 
-  @moduledoc false
+  defmodule Status do
+    @moduledoc """
+    Implements status tokens as stated in [this specification draft](https://github.com/malach-it/vc-decentralized-status/blob/main/SPECIFICATION.md) helping to annotate identity information.
+    """
+
+    @status_table [
+      :valid,
+      :suspended,
+      :revoked
+    ]
+
+    @spec shift(status :: atom()) :: shift :: integer()
+    def shift(status) do
+      Atom.to_string(status)
+      |> :binary.decode_unsigned()
+    end
+
+    @spec generate_status_token(secret :: String.t(), ttl :: integer(), status :: atom()) ::
+            status_token :: String.t()
+    def generate_status_token(secret, ttl, status) do
+      iat =
+        :os.system_time(:microsecond)
+        |> :binary.encode_unsigned()
+        |> :binary.bin_to_list()
+        |> :string.right(7, 0)
+
+      padded_ttl =
+        :binary.encode_unsigned(ttl)
+        |> :binary.bin_to_list()
+        |> :string.right(4, 0)
+
+      status_list =
+        iat ++
+          padded_ttl
+
+      status_information =
+        status_list
+        |> to_string()
+        |> Base.url_encode64(padding: false)
+
+      derived_status =
+        Hotp.generate_hotp(
+          secret,
+          div(:os.system_time(:seconds), ttl) + shift(status)
+        )
+
+      "#{status_information}~#{derived_status}"
+    end
+
+    @spec verify_status_token(secret :: String.t(), status_token :: String.t()) ::
+            status :: atom()
+    def verify_status_token(secret, status_token) do
+      [status_list, hotp] = String.split(status_token, "~")
+
+      %{ttl: ttl} =
+        status_list
+        |> Base.url_decode64!(padding: false)
+        |> to_charlist()
+        |> parse_statuslist()
+
+      Enum.reduce_while(@status_table, :expired, fn status, acc ->
+        case hotp ==
+               Hotp.generate_hotp(
+                 secret,
+                 div(:os.system_time(:seconds), ttl) + shift(status)
+               ) do
+          true -> {:halt, status}
+          false -> {:cont, acc}
+        end
+      end)
+    rescue
+      _ -> :invalid
+    end
+
+    defp parse_statuslist(statuslist) do
+      parse_statuslist(statuslist, {0, %{ttl: [], memory: []}})
+    end
+
+    defp parse_statuslist([], {_index, result}), do: result
+
+    defp parse_statuslist([_char | t], {index, acc}) when index < 7 do
+      parse_statuslist(t, {index + 1, acc})
+    end
+
+    defp parse_statuslist([char | t], {index, acc}) when index < 10 do
+      acc = Map.put(acc, :memory, acc[:memory] ++ [char])
+      parse_statuslist(t, {index + 1, acc})
+    end
+
+    defp parse_statuslist([char | t], {index, acc}) when index == 10 do
+      acc =
+        acc
+        |> Map.put(
+          :ttl,
+          (acc[:memory] ++ [char])
+          |> :erlang.list_to_binary()
+          |> :binary.decode_unsigned()
+        )
+        |> Map.put(:memory, [])
+
+      parse_statuslist(t, {index + 1, acc})
+    end
+  end
 
   alias Boruta.Config
   alias Boruta.Did
@@ -54,12 +158,6 @@ defmodule Boruta.VerifiableCredentials do
   # TT5rRw7VCjbapSKSfZEUSekzuBrGZhfwxQTfsNVeUYsX5gH2eJ4LdVt6uctFyJsW76VygayYHiHpwnhGwAombi\
   # RJiimmRTMXUAa49VQ9NWT7PUK2P7VbBy4Bn"
   @individual_claim_default_expiration 3600 * 24 * 365 * 120
-
-  @status_table [
-    :valid,
-    :suspended,
-    :revoked
-  ]
 
   @authorization_details_schema %{
     "type" => "array",
@@ -105,7 +203,7 @@ defmodule Boruta.VerifiableCredentials do
           credential_params :: map(),
           token :: Boruta.Oauth.Token.t(),
           default_credential_configuration :: map()
-        ) :: {:ok, map()} | {:error, String.t()}
+        ) :: {:ok, credential :: Credential.t()} | {:error, reason :: String.t()}
   def issue_verifiable_credential(
         resource_owner,
         credential_params,
@@ -307,7 +405,7 @@ defmodule Boruta.VerifiableCredentials do
               :ok
           end
 
-        do_validate_headers(alg_check, typ_check, key_check)
+        do_validate_headers([alg_check, typ_check, key_check])
 
       _ ->
         {:error, "Proof does not contain valid JWT headers, `alg` and `typ` are required."}
@@ -338,23 +436,6 @@ defmodule Boruta.VerifiableCredentials do
        when format in ["jwt_vc_json"] do
     client = token.client
 
-    signer =
-      Joken.Signer.create(
-        client.id_token_signature_alg,
-        %{"pem" => client.private_key},
-        %{
-          "typ" => "JWT",
-          "kid" =>
-            case client.did do
-              nil ->
-                Client.Crypto.kid_from_private_key(client.private_key)
-
-              did ->
-                did <> "#" <> String.replace(did, "did:key:", "")
-            end
-        }
-      )
-
     sub =
       case Joken.peek_header(proof) do
         {:ok, headers} ->
@@ -363,23 +444,15 @@ defmodule Boruta.VerifiableCredentials do
           end
       end
 
-    credential_id = SecureRandom.uuid()
-
     now = :os.system_time(:seconds)
-
+    credential_id = SecureRandom.uuid()
     sub = sub |> String.split("#") |> List.first()
-    iss = case client.did do
-      nil ->
-        Config.issuer()
-      did ->
-        did |> String.split("#") |> List.first()
-    end
 
-    claims = %{
+    payload = %{
       "sub" => sub,
       # TODO store credential
       "jti" => Config.issuer() <> "/credentials/#{credential_id}",
-      "iss" => iss,
+      "iss" => Did.controller(client.did) || Config.issuer(),
       "nbf" => now,
       "iat" => now,
       "exp" => now + credential_configuration[:time_to_live],
@@ -411,9 +484,13 @@ defmodule Boruta.VerifiableCredentials do
       }
     }
 
-    credential = Token.generate_and_sign!(claims, signer)
+    case Client.signatures_adapter(client).verifiable_credential_sign(payload, client, format) do
+      {:error, error} ->
+        {:error, error}
 
-    {:ok, credential}
+      credential ->
+        {:ok, credential}
+    end
   end
 
   # https://www.w3.org/TR/vc-data-model-2.0/
@@ -427,40 +504,30 @@ defmodule Boruta.VerifiableCredentials do
        when format in ["jwt_vc"] do
     client = token.client
 
-    signer =
-      Joken.Signer.create(
-        client.id_token_signature_alg,
-        %{"pem" => client.private_key},
-        %{
-          "typ" => "JWT",
-          # TODO craft ebsi compliant dids
-          "kid" => client.did
-        }
-      )
-
     sub =
       case Joken.peek_header(proof) do
         {:ok, headers} ->
-          case(extract_key(headers)) do
+          case extract_key(headers) do
             {_type, key} -> key
           end
       end
 
     credential_id = SecureRandom.uuid()
+    now = :os.system_time(:seconds)
 
-    claims = %{
+    payload = %{
       "@context" => [
-        "https://www.w3.org/ns/credentials/v2",
-        "https://www.w3.org/ns/credentials/examples/v2"
+        "https://www.w3.org/ns/credentials/v2"
       ],
       # TODO store credential
       "id" => Config.issuer() <> "/credentials/#{credential_id}",
+      "issued" => DateTime.from_unix!(now) |> DateTime.to_iso8601(),
+      "issuanceDate" => DateTime.from_unix!(now) |> DateTime.to_iso8601(),
       "type" => credential_configuration[:types],
-      "issuer" => Config.issuer(),
+      "issuer" => Did.controller(client.did),
       "validFrom" => DateTime.utc_now() |> DateTime.to_iso8601(),
       "credentialSubject" => %{
         "id" => sub,
-        # TODO craft ebsi compliant dids
         credential_identifier =>
           claims
           |> Enum.map(fn {name, {claim, _status, _expiration}} -> {name, claim} end)
@@ -472,9 +539,13 @@ defmodule Boruta.VerifiableCredentials do
       }
     }
 
-    credential = Token.generate_and_sign!(claims, signer)
+    case Client.signatures_adapter(client).verifiable_credential_sign(payload, client, format) do
+      {:error, error} ->
+        {:error, error}
 
-    {:ok, credential}
+      credential ->
+        {:ok, credential}
+    end
   end
 
   defp generate_credential(
@@ -487,16 +558,6 @@ defmodule Boruta.VerifiableCredentials do
        when format in ["vc+sd-jwt"] do
     client = token.client
 
-    signer =
-      Joken.Signer.create(
-        client.id_token_signature_alg,
-        %{"pem" => client.private_key},
-        %{
-          "typ" => "dc+sd-jwt",
-          "kid" => client.did || Client.Crypto.kid_from_private_key(client.private_key)
-        }
-      )
-
     sub =
       case Joken.peek_header(proof) do
         {:ok, headers} ->
@@ -507,7 +568,8 @@ defmodule Boruta.VerifiableCredentials do
 
     claims_with_salt =
       Enum.map(claims, fn {name, {value, status, ttl}} ->
-        {{name, value}, generate_sd_salt(client.private_key, ttl, String.to_atom(status))}
+        {{name, value},
+         Status.generate_status_token(client.private_key, ttl, String.to_atom(status))}
       end)
 
     disclosures =
@@ -525,19 +587,11 @@ defmodule Boruta.VerifiableCredentials do
         :crypto.hash(:sha256, disclosure) |> Base.url_encode64(padding: false)
       end)
 
-    iss = case client.did do
-      nil ->
-        Config.issuer()
-      did ->
-        did |> String.split("#") |> List.first()
-    end
-
-    claims = %{
+    payload = %{
       "sub" => sub,
-      "iss" => iss,
       "vct" => credential_configuration[:vct],
+      "iss" => Did.controller(client.did) || Config.issuer(),
       "iat" => :os.system_time(:seconds),
-      # TODO get exp from configuration
       "exp" => :os.system_time(:seconds) + credential_configuration[:time_to_live],
       "_sd" => sd,
       "cnf" => %{
@@ -545,101 +599,23 @@ defmodule Boruta.VerifiableCredentials do
       }
     }
 
-    credential = Token.generate_and_sign!(claims, signer)
+    case Client.signatures_adapter(client).verifiable_credential_sign(payload, client, format) do
+      {:error, error} ->
+        {:error, error}
 
-    tokens =
-      [credential] ++
-        (disclosures
-         |> Enum.map(&Jason.encode!/1)
-         |> Enum.map(&Base.url_encode64(&1, padding: false)))
+      credential ->
+        tokens =
+          [credential] ++
+            (disclosures
+             |> Enum.map(&Jason.encode!/1)
+             |> Enum.map(&Base.url_encode64(&1, padding: false)))
 
-    {:ok, Enum.join(tokens, "~") <> "~"}
+        {:ok, Enum.join(tokens, "~") <> "~"}
+    end
   end
 
   defp generate_credential(_claims, _credential_configuration, _proof, _client, _format),
     do: {:error, "Unkown format."}
-
-  def generate_sd_salt(secret, ttl, status) do
-    iat =
-      :os.system_time(:microsecond)
-      |> :binary.encode_unsigned()
-      |> :binary.bin_to_list()
-      |> :string.right(7, 0)
-
-    padded_ttl =
-      :binary.encode_unsigned(ttl)
-      |> :binary.bin_to_list()
-      |> :string.right(4, 0)
-
-    status_list =
-      iat ++
-        padded_ttl
-
-    salt =
-      status_list
-      |> to_string()
-      |> Base.url_encode64(padding: false)
-
-    hotp =
-      Hotp.generate_hotp(
-        secret,
-        div(:os.system_time(:seconds), ttl) + shift(status)
-      )
-
-    "#{salt}~#{hotp}"
-  end
-
-  def verify_salt(secret, salt) do
-    [status_list, hotp] = String.split(salt, "~")
-
-    %{ttl: ttl} =
-      status_list
-      |> Base.url_decode64!(padding: false)
-      |> to_charlist()
-      |> parse_statuslist()
-
-    Enum.reduce_while(@status_table, :expired, fn status, acc ->
-      case hotp ==
-             Hotp.generate_hotp(
-               secret,
-               div(:os.system_time(:seconds), ttl) + shift(status)
-             ) do
-        true -> {:halt, status}
-        false -> {:cont, acc}
-      end
-    end)
-  rescue
-    _ -> :invalid
-  end
-
-  def parse_statuslist(statuslist) do
-    parse_statuslist(statuslist, {0, %{ttl: [], memory: []}})
-  end
-
-  def parse_statuslist([], {_index, result}), do: result
-
-  def parse_statuslist([_char | t], {index, acc}) when index < 7 do
-    parse_statuslist(t, {index + 1, acc})
-  end
-
-  def parse_statuslist([char | t], {index, acc}) when index < 10 do
-    acc = Map.put(acc, :memory, acc[:memory] ++ [char])
-    parse_statuslist(t, {index + 1, acc})
-  end
-
-  def parse_statuslist([char | t], {index, acc}) when index == 10 do
-    acc =
-      acc
-      |> Map.put(
-        :ttl,
-        (acc[:memory] ++ [char])
-        |> :erlang.list_to_binary()
-        |> :binary.decode_unsigned()
-      )
-      |> Map.put(:memory, [])
-
-    parse_statuslist(t, {index + 1, acc})
-  end
 
   defp extract_credential_claims(resource_owner, credential_configuration) do
     claims =
@@ -671,28 +647,14 @@ defmodule Boruta.VerifiableCredentials do
   defp extract_key(%{"jwk" => jwk}), do: {:jwk, jwk}
   defp extract_key(_headers), do: {:error, "No proof key material found in JWT headers"}
 
-  defp do_validate_headers(alg_check, typ_check, key_check) do
-    case Enum.reject(
-           [
-             alg_check,
-             typ_check,
-             key_check
-           ],
-           fn
-             :ok -> true
-             _ -> false
-           end
-         ) do
-      [] ->
-        :ok
-
-      errors ->
-        {:error, Enum.join(errors, ", ") <> "."}
-    end
+  defp do_validate_headers(checks) do
+    do_validate_headers(checks, [])
   end
 
-  def shift(status) do
-    Atom.to_string(status)
-    |> :binary.decode_unsigned()
-  end
+  defp do_validate_headers([], []), do: :ok
+  defp do_validate_headers([], errors), do: {:error, Enum.join(errors, ", ") <> "."}
+  defp do_validate_headers([:ok | checks], errors), do: do_validate_headers(checks, errors)
+
+  defp do_validate_headers([error | checks], errors),
+    do: do_validate_headers(checks, errors ++ [error])
 end

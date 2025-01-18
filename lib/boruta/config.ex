@@ -4,23 +4,26 @@ defmodule Boruta.Config do
 
   Boruta configuration can be set as following in `config.exs` overriding following default configuration
   ```
-  config :boruta, Boruta.Oauth,
+  config :boruta_ssi, Boruta.Oauth,
     repo: MyApp.Repo, # mandatory
     cache_backend: Boruta.Cache,
     contexts: [
       access_tokens: Boruta.Ecto.AccessTokens,
+      agent_tokens: Boruta.Ecto.AgentTokens,
       clients: Boruta.Ecto.Clients,
       codes: Boruta.Ecto.Codes,
       preauthorized_codes: Boruta.Ecto.PreauthorizedCodes,
       resource_owners: MyApp.ResourceOwners, # mandatory for user flows
       scopes: Boruta.Ecto.Scopes,
       requests: Boruta.Ecto.Requests,
-      credentials: Boruta.Ecto.Credentials
+      credentials: Boruta.Ecto.Credentials,
+      signatures: Boruta.Internal.Signatures
     ],
     max_ttl: [
       authorization_code: 60,
       authorization_request: 60,
       access_token: 60 * 60 * 24,
+      agent_token: 60 * 60 * 24 * 30,
       id_token: 60 * 60 * 24,
       refresh_token: 60 * 60 * 24 * 30
     ],
@@ -40,24 +43,29 @@ defmodule Boruta.Config do
   @defaults cache_backend: Boruta.Cache,
             contexts: [
               access_tokens: Boruta.Ecto.AccessTokens,
+              agent_tokens: Boruta.Ecto.AgentTokens,
               clients: Boruta.Ecto.Clients,
               codes: Boruta.Ecto.Codes,
               preauthorized_codes: Boruta.Ecto.PreauthorizedCodes,
               resource_owners: nil,
               scopes: Boruta.Ecto.Scopes,
               requests: Boruta.Ecto.Requests,
-              credentials: Boruta.Ecto.Credentials
+              credentials: Boruta.Ecto.Credentials,
             ],
             max_ttl: [
               authorization_request: 300,
               authorization_code: 60,
               access_token: 60 * 60 * 24,
+              agent_token: 60 * 60 * 24 * 30,
               id_token: 60 * 60 * 24,
               refresh_token: 60 * 60 * 24 * 30
             ],
             ebsi_did_resolver_base_url: "https://api-conformance.ebsi.eu/did-registry/v5",
             did_resolver_base_url: "https://api.godiddy.com/1.0.0/universal-resolver",
             did_registrar_base_url: "https://api.godiddy.com/1.0.0/universal-registrar",
+            signature_credentials_base_url: "https://api.godiddy.com/1.0.0/universal-issuer/credentials/issue",
+            universal_keys_base_url: "https://api.godiddy.com/0.1.0/wallet-service/keys",
+            universal_sign_base_url: "https://api.godiddy.com/0.1.0/wallet-service/keys/sign",
             universal_did_auth: %{
               type: "bearer",
               token: nil
@@ -81,6 +89,12 @@ defmodule Boruta.Config do
   @doc false
   def access_token_max_ttl do
     Keyword.fetch!(oauth_config(), :max_ttl)[:access_token]
+  end
+
+  @spec agent_token_max_ttl() :: integer()
+  @doc false
+  def agent_token_max_ttl do
+    Keyword.fetch!(oauth_config(), :max_ttl)[:agent_token]
   end
 
   @spec authorization_code_max_ttl() :: integer()
@@ -117,6 +131,12 @@ defmodule Boruta.Config do
   @doc false
   def access_tokens do
     Keyword.fetch!(oauth_config(), :contexts)[:access_tokens]
+  end
+
+  @spec agent_tokens() :: module()
+  @doc false
+  def agent_tokens do
+    Keyword.fetch!(oauth_config(), :contexts)[:agent_tokens]
   end
 
   @spec clients() :: module()
@@ -164,7 +184,7 @@ defmodule Boruta.Config do
         Missing configuration for resource_owners context. You can set your own
         `Boruta.Oauth.ResourceOwners` behaviour implementation in config:
 
-          config :boruta, Boruta.Oauth,
+          config :boruta_ssi, Boruta.Oauth,
             repo: MyApp.Repo,
             contexts: [
               resource_owners: MyApp.ResourceOwners
@@ -194,6 +214,24 @@ defmodule Boruta.Config do
     Keyword.fetch!(oauth_config(), :did_registrar_base_url)
   end
 
+  @spec signature_credentials_base_url() :: String.t()
+  @doc false
+  def signature_credentials_base_url do
+    Keyword.fetch!(oauth_config(), :signature_credentials_base_url)
+  end
+
+  @spec universal_keys_base_url() :: String.t()
+  @doc false
+  def universal_keys_base_url do
+    Keyword.fetch!(oauth_config(), :universal_keys_base_url)
+  end
+
+  @spec universal_sign_base_url() :: String.t()
+  @doc false
+  def universal_sign_base_url do
+    Keyword.fetch!(oauth_config(), :universal_sign_base_url)
+  end
+
   @spec universal_did_auth() :: map()
   @doc false
   def universal_did_auth do
@@ -211,7 +249,7 @@ defmodule Boruta.Config do
   defp oauth_config do
       Keyword.merge(
         @defaults,
-        Application.get_env(:boruta, Boruta.Oauth) || [],
+        Application.get_env(:boruta_ssi, Boruta.Oauth) || [],
         fn _, a, b ->
           if Keyword.keyword?(a) && Keyword.keyword?(b) do
             Keyword.merge(a, b)

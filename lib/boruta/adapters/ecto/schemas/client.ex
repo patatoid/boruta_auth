@@ -12,6 +12,7 @@ defmodule Boruta.Ecto.Client do
       token_generator: 0,
       repo: 0,
       access_token_max_ttl: 0,
+      agent_token_max_ttl: 0,
       authorization_code_max_ttl: 0,
       authorization_request_max_ttl: 0,
       id_token_max_ttl: 0,
@@ -22,6 +23,7 @@ defmodule Boruta.Ecto.Client do
   alias Boruta.Ecto.Scope
   alias Boruta.Oauth
   alias Boruta.Oauth.Client
+  alias Boruta.Universal
   alias ExJsonSchema.Validator.Error.BorutaFormatter
 
   @type t :: %__MODULE__{
@@ -35,6 +37,7 @@ defmodule Boruta.Ecto.Client do
           public_refresh_token: boolean(),
           public_revoke: boolean(),
           access_token_ttl: integer(),
+          agent_token_ttl: integer(),
           authorization_code_ttl: integer(),
           refresh_token_ttl: integer(),
           authorized_scopes: Ecto.Association.NotLoaded.t() | list(Scope.t()),
@@ -46,7 +49,8 @@ defmodule Boruta.Ecto.Client do
           jwt_public_key: String.t(),
           public_key: String.t(),
           private_key: String.t(),
-          response_mode: String.t()
+          response_mode: String.t(),
+          signatures_adapter: String.t()
         }
 
   @token_endpoint_auth_methods [
@@ -70,10 +74,10 @@ defmodule Boruta.Ecto.Client do
   @key_pair_type_schema %{
     "type" => "object",
     "properties" => %{
-      "type" => %{"type" => "string", "pattern" => "^ec|rsa"},
+      "type" => %{"type" => "string", "pattern" => "^ec|rsa|universal$"},
       "modulus_size" => %{"type" => "string"},
       "exponent_size" => %{"type" => "string"},
-      "curve" => %{"type" => "string", "pattern" => "^P-256|P-384|P-512"}
+      "curve" => %{"type" => "string", "pattern" => "^P-256|P-384|P-512$"}
     },
     "required" => ["type"]
   }
@@ -94,6 +98,9 @@ defmodule Boruta.Ecto.Client do
       "HS256",
       "HS384",
       "HS512"
+    ],
+    "universal" => [
+      "EdDSA"
     ]
   }
 
@@ -117,6 +124,7 @@ defmodule Boruta.Ecto.Client do
     field(:public_revoke, :boolean, default: false)
 
     field(:access_token_ttl, :integer)
+    field(:agent_token_ttl, :integer)
     field(:authorization_code_ttl, :integer)
     field(:authorization_request_ttl, :integer)
     field(:id_token_ttl, :integer)
@@ -124,6 +132,8 @@ defmodule Boruta.Ecto.Client do
 
     field(:id_token_signature_alg, :string, default: "RS512")
     field(:id_token_kid, :string)
+
+    field(:signatures_adapter, :string, default: "Elixir.Boruta.Internal.Signatures")
 
     field(:key_pair_type, :map,
       default: %{
@@ -169,6 +179,7 @@ defmodule Boruta.Ecto.Client do
       :secret,
       :confidential,
       :access_token_ttl,
+      :agent_token_ttl,
       :authorization_code_ttl,
       :authorization_request_ttl,
       :refresh_token_ttl,
@@ -192,11 +203,13 @@ defmodule Boruta.Ecto.Client do
       :logo_uri,
       :metadata,
       :response_mode,
-      :key_pair_type
+      :signatures_adapter,
+      :key_pair_type,
     ])
     |> validate_required([:redirect_uris, :key_pair_type])
     |> unique_constraint(:id, name: :clients_pkey)
     |> change_access_token_ttl()
+    |> change_agent_token_ttl()
     |> change_authorization_code_ttl()
     |> change_authorization_request_ttl()
     |> change_id_token_ttl()
@@ -216,6 +229,7 @@ defmodule Boruta.Ecto.Client do
     )
     |> put_assoc(:authorized_scopes, parse_authorized_scopes(attrs))
     |> translate_jwk()
+    |> validate_signatures_adapter()
     |> validate_key_pair_type()
     |> generate_key_pair()
     |> put_secret()
@@ -230,6 +244,7 @@ defmodule Boruta.Ecto.Client do
       :secret,
       :confidential,
       :access_token_ttl,
+      :agent_token_ttl,
       :authorization_code_ttl,
       :authorization_request_ttl,
       :refresh_token_ttl,
@@ -253,16 +268,19 @@ defmodule Boruta.Ecto.Client do
       :logo_uri,
       :metadata,
       :response_mode,
+      :signatures_adapter,
       :key_pair_type
     ])
     |> validate_required([
       :authorization_code_ttl,
       :access_token_ttl,
+      :agent_token_ttl,
       :refresh_token_ttl,
       :id_token_ttl,
       :key_pair_type
     ])
     |> validate_inclusion(:access_token_ttl, 1..access_token_max_ttl())
+    |> validate_inclusion(:agent_token_ttl, 1..agent_token_max_ttl())
     |> validate_inclusion(:authorization_code_ttl, 1..authorization_code_max_ttl())
     |> validate_inclusion(:access_token_ttl, 1..authorization_request_max_ttl())
     |> validate_inclusion(:refresh_token_ttl, 1..refresh_token_max_ttl())
@@ -281,6 +299,7 @@ defmodule Boruta.Ecto.Client do
     |> validate_supported_grant_types()
     |> validate_id_token_signature_alg()
     |> put_assoc(:authorized_scopes, parse_authorized_scopes(attrs))
+    |> validate_signatures_adapter()
     |> validate_key_pair_type()
     |> translate_jwk()
   end
@@ -310,6 +329,16 @@ defmodule Boruta.Ecto.Client do
 
       :error ->
         put_change(changeset, :access_token_ttl, access_token_max_ttl())
+    end
+  end
+
+  defp change_agent_token_ttl(changeset) do
+    case fetch_change(changeset, :agent_token_ttl) do
+      {:ok, _agent_token_ttl} ->
+        validate_inclusion(changeset, :agent_token_ttl, 1..agent_token_max_ttl())
+
+      :error ->
+        put_change(changeset, :agent_token_ttl, agent_token_max_ttl())
     end
   end
 
@@ -354,6 +383,19 @@ defmodule Boruta.Ecto.Client do
 
       :error ->
         put_change(changeset, :id_token_ttl, id_token_max_ttl())
+    end
+  end
+
+  defp validate_signatures_adapter(changeset) do
+    key_pair_type = get_field(changeset, :key_pair_type)
+
+    case key_pair_type do
+      %{"type" => "universal"} ->
+        validate_inclusion(changeset, :signatures_adapter, [Atom.to_string(Boruta.Universal.Signatures)])
+      %{"type" => type} when type in ["ec", "rsa"] ->
+        validate_inclusion(changeset, :signatures_adapter, [Atom.to_string(Boruta.Internal.Signatures)])
+      _ ->
+        add_error(changeset, :signatures_adapter, "unknown key pair type")
     end
   end
 
@@ -461,6 +503,9 @@ defmodule Boruta.Ecto.Client do
         %{"type" => "ec", "curve" => curve} ->
           JOSE.JWK.generate_key({:ec, curve})
 
+        %{"type" => "universal"} ->
+          "universal"
+
         _ ->
           nil
       end
@@ -468,6 +513,25 @@ defmodule Boruta.Ecto.Client do
     case private_key do
       nil ->
         add_error(changeset, :private_key, "private_key_type is invalid")
+
+      "universal" ->
+        with {:ok, did, jwk} <- Did.create("key"),
+             {:ok, key_id} <- Universal.Signatures.SigningKey.get_key_by_did(did) do
+          "did:key:" <> key = did
+          public_key = JOSE.JWK.from_map(jwk)
+          {_type, public_pem} = JOSE.JWK.to_pem(public_key)
+
+          changeset
+          |> put_change(:private_key, key_id["id"])
+          |> put_change(:public_key, public_pem)
+          |> put_change(:did, "#{did}##{key}")
+          |> put_change(:signatures_adapter, Boruta.Universal.Signatures |> Atom.to_string())
+          |> put_change(:id_token_signature_alg, "EdDSA")
+          |> put_change(:userinfo_signed_response_alg, "EdDSA")
+        else
+          {:error, error} ->
+            add_error(changeset, :private_key, error)
+        end
 
       private_key ->
         public_key = JOSE.JWK.to_public(private_key)
@@ -478,6 +542,7 @@ defmodule Boruta.Ecto.Client do
         changeset
         |> put_change(:public_key, public_pem)
         |> put_change(:private_key, private_pem)
+        |> put_change(:signatures_adapter, Boruta.Internal.Signatures |> Atom.to_string())
     end
   end
 
@@ -503,8 +568,9 @@ defmodule Boruta.Ecto.Client do
         {_, jwk} = JOSE.JWK.from_pem(pem) |> JOSE.JWK.to_map()
 
         case Did.create("key", jwk) do
-          {:ok, did} ->
-            put_change(changeset, :did, did)
+          {:ok, did, _jwk} ->
+            "did:key:" <> key = did
+            put_change(changeset, :did, "#{did}##{key}")
 
           {:error, error} ->
             add_error(changeset, :did, error)

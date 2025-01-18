@@ -2,6 +2,8 @@ defmodule Boruta.Oauth.Request.Base do
   @moduledoc false
 
   alias Boruta.BasicAuth
+  alias Boruta.Oauth.AgentCodeRequest
+  alias Boruta.Oauth.AgentCredentialsRequest
   alias Boruta.Oauth.AuthorizationCodeRequest
   alias Boruta.Oauth.AuthorizationRequest
   alias Boruta.Oauth.ClientCredentialsRequest
@@ -15,8 +17,8 @@ defmodule Boruta.Oauth.Request.Base do
   alias Boruta.Oauth.RefreshTokenRequest
   alias Boruta.Oauth.RevokeRequest
   alias Boruta.Oauth.TokenRequest
+  alias Boruta.Openid.VerifiableCredentials
   alias Boruta.RequestsAdapter
-  alias Boruta.VerifiableCredentials
 
   @spec authorization_header(req_headers :: list()) ::
           {:ok, header :: String.t()}
@@ -35,6 +37,18 @@ defmodule Boruta.Oauth.Request.Base do
        client_authentication: client_authentication_from_params(params),
        scope: params["scope"],
        dpop: params["dpop"]
+     }}
+  end
+
+  def build_request(%{"grant_type" => "agent_credentials"} = params) do
+    {:ok,
+     %AgentCredentialsRequest{
+       client_id: params["client_id"],
+       client_authentication: client_authentication_from_params(params),
+       scope: params["scope"],
+       dpop: params["dpop"],
+       bind_data: params["bind_data"],
+       bind_configuration: params["bind_configuration"]
      }}
   end
 
@@ -61,6 +75,20 @@ defmodule Boruta.Oauth.Request.Base do
      }}
   end
 
+  def build_request(%{"grant_type" => "agent_code"} = params) do
+    {:ok,
+     %AgentCodeRequest{
+       client_id: params["client_id"],
+       client_authentication: client_authentication_from_params(params),
+       code: params["code"],
+       redirect_uri: params["redirect_uri"],
+       code_verifier: params["code_verifier"],
+       dpop: params["dpop"],
+       bind_data: params["bind_data"],
+       bind_configuration: params["bind_configuration"]
+     }}
+  end
+
   def build_request(
         %{"grant_type" => "urn:ietf:params:oauth:grant-type:pre-authorized_code"} = params
       ) do
@@ -77,6 +105,7 @@ defmodule Boruta.Oauth.Request.Base do
       ) do
     {:ok,
      %PreauthorizedCodeRequest{
+       agent_token: params["agent_token"],
        client_id: params["client_id"],
        redirect_uri: params["redirect_uri"],
        resource_owner: params["resource_owner"],
